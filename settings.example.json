@@ -1,0 +1,40 @@
+{
+  "$comment": "Reference only. Claude Code does not expand $HOME in hook commands - replace every $HOME below with a real absolute path before use.",
+  "statusLine": {
+    "type": "command",
+    "command": "python3 $HOME/.claude/hooks/statusline.py"
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node $HOME/.claude/hooks/caveman-activate.js",
+            "timeout": 5,
+            "statusMessage": "Loading caveman mode..."
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node $HOME/.claude/hooks/caveman-mode-tracker.js",
+            "timeout": 5,
+            "statusMessage": "Tracking caveman mode..."
+          }
+        ]
+      }
+    ]
+  },
+  "model": "opus[1m]",
+  "effortLevel": "medium",
+  "alwaysThinkingEnabled": false,
+  "theme": "dark",
+  "tui": "fullscreen",
+  "inputNeededNotifEnabled": true,
+  "agentPushNotifEnabled": true
+}

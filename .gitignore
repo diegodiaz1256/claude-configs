@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+
+# Local overrides are per-machine by design
+settings.local.json
+
+# Backups the install script writes
+*.bak
+backups/
+
+# Real settings: machine-specific paths. See settings.example.json.
+settings.json
