@@ -425,6 +425,12 @@ def session_name_lookup(session_id, cfg_dir=None):
             except (OSError, ValueError):
                 continue
             if isinstance(rec, dict) and rec.get("sessionId") == session_id:
+                # nameSource "auto" is an AI-generated long title (e.g. "Omarchy
+                # setup review"), not a SendMessage-addressable tag -- only
+                # "derived" (work-xx) and "user" (explicit --name/rename) are
+                # short handles. Treat "auto" as no usable name.
+                if rec.get("nameSource") not in ("derived", "user"):
+                    continue
                 name = rec.get("name")
                 if isinstance(name, str) and name:
                     return name
