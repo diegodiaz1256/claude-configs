@@ -209,9 +209,9 @@ def burn_arrow(pct, resets_at, window_secs):
         return None
 
     drift = float(pct) - elapsed_share
-    if drift > 10:
+    if drift > 5:
         return f"{RED}{G_UP}{RESET}"
-    if drift < -10:
+    if drift < -5:
         return f"{GREEN}{G_DOWN}{RESET}"
     return None
 
