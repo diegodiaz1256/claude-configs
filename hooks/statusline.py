@@ -23,6 +23,30 @@ import subprocess
 import sys
 import time
 
+# --------------------------------------------------------------- local config
+
+# Per-machine tuning that should never round-trip through git: font rendering
+# quirks, a preferred bar width, threshold taste. Lives outside the repo, one
+# JSON file, absent by default. Any bad or missing file is silently ignored so
+# a typo here can never take the statusline down with it.
+LOCAL_CONFIG_PATH = os.path.join(
+    os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude"),
+    "statusline.local.json",
+)
+
+
+def load_local_config(path=None):
+    path = path or LOCAL_CONFIG_PATH
+    try:
+        with open(path, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+LOCAL = load_local_config()
+
 # ---------------------------------------------------------------- ansi helpers
 
 RESET = "\033[0m"
@@ -77,8 +101,8 @@ def tier(pct):
 # A gauge only earns its bar once it is worth looking at. Below this it renders
 # as a bare number, which keeps line 2 short during the long quiet stretch of a
 # session and lets it widen exactly when something is filling up.
-BAR_THRESHOLD = 60.0
-BAR_WIDTH = 8
+BAR_THRESHOLD = LOCAL.get("bar_threshold", 60.0)
+BAR_WIDTH = LOCAL.get("bar_width", 8)
 
 # Cache hit ratio stays hidden above this — a warm cache is the normal state and
 # needs no column. Below it, a miss actually cost something worth seeing.
@@ -100,12 +124,15 @@ CACHE_TTL_WARN_SECS = 8 * 60
 # Early in a window the elapsed share is tiny, so a single heavy turn trips the
 # pace comparison on noise alone. Stay quiet until enough of the window has run
 # for the extrapolation to mean anything.
-BURN_MIN_ELAPSED = 25.0
+BURN_MIN_ELAPSED = LOCAL.get("burn_min_elapsed", 25.0)
 
 # ...but past this much of the quota, the reading is worth flagging whatever the
 # clock says: half a window spent in its first hour is the situation the arrow
 # exists for, not the noise the floor guards against.
-BURN_ALWAYS_PCT = 50.0
+BURN_ALWAYS_PCT = LOCAL.get("burn_always_pct", 50.0)
+
+# How far pct can drift from elapsed-share before the pace arrow fires.
+BURN_DRIFT_THRESHOLD = LOCAL.get("burn_drift_threshold", 5.0)
 
 # Reading HEAD is a single file read, so a short timeout is plenty. The dirty
 # check walks the work tree and gets its own, larger budget — on a WSL2 mount of
@@ -128,6 +155,11 @@ CACHE_DIR = os.path.join(
 FILLED = "▰"
 TRACK = "▱"
 
+# Space between bar cells. Some fonts render these block glyphs tight enough
+# to touch/overlap; a per-machine override in statusline.local.json
+# ({"segment_spacing": " "}) fixes that without forking the script.
+SEGMENT_SPACING = LOCAL.get("segment_spacing", "")
+
 
 def bar(pct, width=BAR_WIDTH):
     """Segmented gauge, whole cells, absolute 0..100.
@@ -137,7 +169,7 @@ def bar(pct, width=BAR_WIDTH):
     is only drawn over part of the range.
     """
     if pct is None:
-        return f"{DIM}{TRACK * width}{RESET}"
+        return f"{DIM}{SEGMENT_SPACING.join(TRACK * width)}{RESET}"
 
     pct = max(0.0, min(100.0, float(pct)))
     c = tier(pct)
@@ -150,7 +182,10 @@ def bar(pct, width=BAR_WIDTH):
     filled = max(0, filled)
 
     # Width is constant, so the line never shifts as the value climbs.
-    return f"{c}{FILLED * filled}{DIM}{TRACK * (width - filled)}{RESET}"
+    filled_part = SEGMENT_SPACING.join(FILLED * filled)
+    track_part = SEGMENT_SPACING.join(TRACK * (width - filled))
+    sep = SEGMENT_SPACING if filled and filled < width else ""
+    return f"{c}{filled_part}{sep}{DIM}{track_part}{RESET}"
 
 
 def gauge(label, pct, width=BAR_WIDTH):
@@ -209,9 +244,9 @@ def burn_arrow(pct, resets_at, window_secs):
         return None
 
     drift = float(pct) - elapsed_share
-    if drift > 5:
+    if drift > BURN_DRIFT_THRESHOLD:
         return f"{RED}{G_UP}{RESET}"
-    if drift < -5:
+    if drift < -BURN_DRIFT_THRESHOLD:
         return f"{GREEN}{G_DOWN}{RESET}"
     return None
 

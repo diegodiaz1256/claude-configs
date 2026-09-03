@@ -3,6 +3,7 @@ __pycache__/
 
 # Local overrides are per-machine by design
 settings.local.json
+statusline.local.json
 
 # Backups the install script writes
 *.bak
