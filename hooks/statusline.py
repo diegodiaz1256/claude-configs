@@ -394,6 +394,43 @@ def git_segment(cwd):
     return f"{CYAN}{branch}{RED}{mark}{RESET}"
 
 
+# ------------------------------------------------------------------ session
+
+SESSIONS_DIR_NAME = "sessions"
+
+
+def session_name_lookup(session_id, cfg_dir=None):
+    """Short SendMessage/ListAgents name (e.g. "work-aa") for this session_id.
+
+    Undocumented internal state: Claude Code drops one <pid>.json per running
+    process under ~/.claude/sessions, each carrying its own sessionId and
+    name. There is no index by session_id, so this scans the directory --
+    fine at the handful of files a single machine ever has open. Any failure
+    (missing dir, bad JSON, no match) returns None so the caller's hash
+    fallback takes over instead of showing a wrong or crashed segment.
+    """
+    cfg_dir = cfg_dir or os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    sessions_dir = os.path.join(cfg_dir, SESSIONS_DIR_NAME)
+    try:
+        entries = os.scandir(sessions_dir)
+    except OSError:
+        return None
+    with entries:
+        for entry in entries:
+            if not entry.name.endswith(".json"):
+                continue
+            try:
+                with open(entry.path, encoding="utf-8") as f:
+                    rec = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if isinstance(rec, dict) and rec.get("sessionId") == session_id:
+                name = rec.get("name")
+                if isinstance(name, str) and name:
+                    return name
+    return None
+
+
 # ---------------------------------------------------------------------- main
 
 
@@ -463,6 +500,17 @@ def main():
     agent = dig(data, "agent", "name")
     if agent:
         left.append((2, f"{GREY}{G_AGENT} {agent}{RESET}"))
+
+    # Session tag: the short name (e.g. "work-aa") SendMessage/ListAgents use
+    # to address this session. That name isn't in the statusline JSON at all
+    # -- it lives in Claude Code's internal ~/.claude/sessions/<pid>.json,
+    # keyed by the same session_id we do get. Undocumented, best-effort: any
+    # lookup failure falls back to a hash slice that at least matches the
+    # bracketed suffix ListAgents prints next to the name.
+    sess_id = dig(data, "session_id")
+    if sess_id:
+        tag = session_name_lookup(sess_id) or sess_id[:6]
+        left.append((3, f"{GREY}ID {CYAN}{tag}{RESET}"))
 
     vim_mode = dig(data, "vim", "mode")
     if vim_mode:
