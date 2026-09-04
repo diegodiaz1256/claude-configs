@@ -27,6 +27,7 @@ Line 1 is identity, line 2 is pressure. Under load:
 | PR |  `pr.number` | Review state as a trailing icon. `MR` glyph for GitLab. |
 | diff |  `cost.total_lines_*` | Only the non-zero halves render. |
 | agent |  `agent.name` | Present only under `--agent`. |
+| `as` | `~/.claude/sessions/*.json` | This session's current SendMessage/ListAgents name. It's a self-report, not a durable address: dialable by a peer that already has this session in its own live ListAgents, not guaranteed for others. Name/ref auto-derive from conversation title and drift over time, so a value read here can go stale before it's handed to someone else, not just across renders. Multi-word names are quoted. |
 | vim | `vim.mode` | Present only with vim mode enabled. |
 
 ### Line 2

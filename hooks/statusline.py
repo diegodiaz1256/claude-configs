@@ -583,6 +583,17 @@ def session_name_lookup(session_id, cfg_dir=None):
                 # (e.g. "pr-auditor-footer-styling") routes a SendMessage by
                 # that exact name just like a "derived" work-xx one does. The
                 # field describes how the name was picked, not whether it works.
+                #
+                # Caveat this segment cannot fix: this is a *self-report*, the
+                # same string ListAgents prints as "This session is X [ref]"
+                # for itself. It is reachable from a peer that already has
+                # this session in ITS OWN live ListAgents -- but a peer with
+                # no such row (different machine, stale/never-populated
+                # listing) cannot dial this name even though it looks like a
+                # normal ListAgents row. It also drifts: the name can change
+                # between when this renders and when someone acts on it.
+                # Read this ID as "what I currently call myself", not as a
+                # guarantee any given peer can reach it.
                 name = rec.get("name")
                 if isinstance(name, str) and name:
                     return name
@@ -688,8 +699,24 @@ def main():
             # Quote a multi-word tag ("Omarchy setup review") so it visually
             # stands apart from a bare short one ("work-aa") and reads as one
             # name to pass whole to SendMessage, not several words.
+            #
+            # Label is "as", not "ID": "ID" reads like a stable, portable
+            # identifier and invites copy-pasting this value into another
+            # session's SendMessage as if it were a durable address -- it
+            # isn't. This is a self-report (same string ListAgents prints as
+            # "This session is X [ref]" for itself); it's dialable by a peer
+            # that already has this session in ITS OWN live ListAgents, but
+            # not by one that doesn't. And it isn't just unreachable-or-not:
+            # the name/ref itself drifts (auto-derived from conversation
+            # title), so a value read off this line can go stale between
+            # when it's read and when someone hands it to another session --
+            # not only across renders. "as work-aa" says "this is what I'm
+            # currently called right now" without implying portability or
+            # shelf life. (Confirmed with a peer session that hit this exact
+            # footgun cross-machine -- see memory
+            # sendmessage-self-reported-name-unreachable.)
             shown = f'"{tag}"' if " " in tag else tag
-            left.append((3, f"{GREY}ID {CYAN}{shown}{RESET}"))
+            left.append((3, f"{GREY}as {CYAN}{shown}{RESET}"))
 
     vim_mode = dig(data, "vim", "mode")
     if vim_mode:
