@@ -5,5 +5,6 @@
   "bar_threshold": 60.0,
   "burn_min_elapsed": 25.0,
   "burn_always_pct": 50.0,
-  "burn_drift_threshold": 5.0
+  "burn_drift_threshold": 5.0,
+  "service_status_cache_secs": 300.0
 }

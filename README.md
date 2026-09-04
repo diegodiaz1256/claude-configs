@@ -21,6 +21,7 @@ Line 1 is identity, line 2 is pressure. Under load:
 | Segment | Source | Notes |
 |---|---|---|
 | `CV` | `~/.claude/.caveman-active` | Caveman mode. Color is the level: grey `CV-` lite, orange `CV` full, red `CV+` ultra, cyan for the wenyan family, `CVc`/`CVr`/`CVz` for commit/review/compress. |
+| SVC |  [status.claude.com](https://status.claude.com) | Only appears when the Claude Code component is degraded, in a partial/major outage, or under maintenance — silent the rest of the time. See below. |
 | model |  `model.display_name` | `:effort` suffix, plus a bolt when fast mode is on. |
 | branch |  `git` | Red `*` when dirty; worktree name appended when in one. |
 | PR |  `pr.number` | Review state as a trailing icon. `MR` glyph for GitLab. |
@@ -39,8 +40,26 @@ Line 1 is identity, line 2 is pressure. Under load:
 |  exp | Cache TTL, shown only within 8 minutes of expiry — the window where pausing actually costs a re-cache. |
 
 Both lines are fitted to the terminal width and shed segments by priority rather
-than wrapping. `ctx`, the model, and the caveman badge never drop; vim goes
-first, then diff/cache, then PR/agent, then the weekly window, then the 5-hour one.
+than wrapping. `ctx`, the model, the caveman badge, and an active incident never
+drop; vim goes first, then diff/cache, then PR/agent, then the weekly window,
+then the 5-hour one.
+
+### Service status (`SVC`)
+
+Polls the public, unauthenticated [status.claude.com](https://status.claude.com)
+Statuspage API for the health of the **Claude Code** component specifically —
+not claude.ai or the API, which can be down independently. The render path
+never makes the network call itself: it only ever reads a small cache file at
+`~/.claude/cache/statusline/service-status.json`, and if that file is missing
+or older than 5 minutes, it spawns a detached background process to refresh it
+for the *next* render. A slow or unreachable status page therefore costs one
+render without the segment, never a frozen prompt — and a fetch that fails
+outright leaves the previous cached value alone rather than clearing it, so a
+real incident stays visible across the whole cache window even through
+repeated failed refreshes.
+
+Override the poll interval with `service_status_cache_secs` in
+`statusline.local.json` (seconds, default `300`).
 
 ## Requirements
 
@@ -89,17 +108,22 @@ otherwise. Only `statusLine` is needed for this repo.
 
 ## Tuning
 
-Constants at the top of `hooks/statusline.py`:
+Most of these are overridable per machine via `~/.claude/statusline.local.json`
+(see `statusline.local.example.json` for the key names) without forking the
+script; the rest are constants at the top of `hooks/statusline.py`.
 
-| Constant | Default | Effect |
-|---|---|---|
-| `BAR_WIDTH` | `8` | Gauge segments. 10 or 12 splits the 86-99% range, which currently flattens. |
-| `BAR_THRESHOLD` | `60.0` | Below this a gauge is a bare number. |
-| `COMPACT_WARN` | `85.0` | Where ctx grows its warning. |
-| `CACHE_HEALTHY` | `70.0` | Above this the cache gauge stays hidden. |
-| `CACHE_TTL_WARN_SECS` | `480` | How close to expiry `exp` appears. |
-| `BURN_MIN_ELAPSED` | `25.0` | Window share that must elapse before a pace arrow. |
-| `BURN_ALWAYS_PCT` | `50.0` | Quota share that shows the arrow regardless of the floor. |
+| Setting | Local key | Default | Effect |
+|---|---|---|---|
+| `BAR_WIDTH` | `bar_width` | `8` | Gauge segments. 10 or 12 splits the 86-99% range, which currently flattens. |
+| `BAR_THRESHOLD` | `bar_threshold` | `60.0` | Below this a gauge is a bare number. |
+| `SEGMENT_SPACING` | `segment_spacing` | `""` | Inserted between bar cells; some fonts render them touching without it. |
+| `BURN_MIN_ELAPSED` | `burn_min_elapsed` | `25.0` | Window share that must elapse before a pace arrow. |
+| `BURN_ALWAYS_PCT` | `burn_always_pct` | `50.0` | Quota share that shows the arrow regardless of the floor. |
+| `BURN_DRIFT_THRESHOLD` | `burn_drift_threshold` | `5.0` | How far usage must drift from elapsed share before the arrow fires. |
+| `SERVICE_STATUS_CACHE_SECS` | `service_status_cache_secs` | `300.0` | How often the `SVC` segment re-polls status.claude.com. |
+| `COMPACT_WARN` | — | `85.0` | Where ctx grows its warning. |
+| `CACHE_HEALTHY` | — | `70.0` | Above this the cache gauge stays hidden. |
+| `CACHE_TTL_WARN_SECS` | — | `480` | How close to expiry `exp` appears. |
 
 The color tiers live in `tier()`: green below 60, yellow to 85, red above.
 
@@ -125,3 +149,8 @@ The color tiers live in `tier()`: green below 60, yellow to 85, red above.
   slow repository lost its branch along with its dirty flag. The dirty answer is
   cached for 10s under `~/.claude/cache/statusline`, so it can lag that far
   behind reality.
+- The `SVC` segment never calls the network from the render path — it only ever
+  reads a cache file and, on a stale or missing one, spawns a detached
+  background process to refresh it for the *next* render. A failed refresh
+  leaves the previous cached value in place rather than clearing it, so a real
+  incident survives repeated failed polls instead of flickering off.

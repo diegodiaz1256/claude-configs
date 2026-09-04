@@ -85,6 +85,7 @@ G_DRAFT = "" if NF else "-"
 G_UP = "" if NF else "^"       # arrow-up, burning ahead of pace
 G_DOWN = "" if NF else "v"     # arrow-down, comfortably behind pace
 G_TTL = "" if NF else "exp"    # clock-o, cache expiry
+G_PULSE = "" if NF else "SVC"  # heartbeat, status.claude.com component health
 
 
 def tier(pct):
@@ -147,6 +148,19 @@ CACHE_DIR = os.path.join(
     os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude"),
     "cache", "statusline",
 )
+
+# status.claude.com is a public, unauthenticated Statuspage instance. How often
+# to re-poll it — an incident is not the kind of thing that needs sub-minute
+# freshness, and this is a courtesy check against someone else's endpoint, not
+# a monitoring system.
+SERVICE_STATUS_URL = "https://status.claude.com/api/v2/summary.json"
+SERVICE_STATUS_CACHE_SECS = LOCAL.get("service_status_cache_secs", 300.0)
+SERVICE_STATUS_TIMEOUT = 3.0
+SERVICE_STATUS_CACHE_PATH = os.path.join(CACHE_DIR, "service-status.json")
+# The named Claude Code component on that page, distinct from claude.ai and the
+# API — an outage in one does not imply the others, and this is the one that
+# actually affects a Claude Code session.
+SERVICE_STATUS_COMPONENT = "Claude Code"
 
 
 # Discrete segments, no partial cells. Sub-cell glyphs mixed heights within one
@@ -429,6 +443,108 @@ def git_segment(cwd):
     return f"{CYAN}{branch}{RED}{mark}{RESET}"
 
 
+# -------------------------------------------------------------- service status
+
+# Statuspage's own vocabulary, worst to best. Anything not in this list (a new
+# indicator value the page starts using, or a timed-out/malformed response)
+# renders nothing rather than guess a severity for it.
+_SERVICE_STATUS_TIER = {
+    "major_outage": (RED, "outage"),
+    "partial_outage": (RED, "partial outage"),
+    "degraded_performance": (YELLOW, "degraded"),
+    "under_maintenance": (YELLOW, "maintenance"),
+}
+
+
+def _read_service_status_cache():
+    """(status_str, fetched_at) from disk, or (None, None) if absent/corrupt."""
+    try:
+        with open(SERVICE_STATUS_CACHE_PATH, encoding="utf-8") as f:
+            rec = json.load(f)
+        return rec.get("status"), float(rec.get("fetched_at", 0))
+    except (OSError, ValueError, TypeError):
+        return None, None
+
+
+def _spawn_background_refresh():
+    """Fire-and-forget a refresh of the cache file; never block the render.
+
+    Re-invokes this same script with an internal flag so there is no second
+    file to install or keep in sync. Detached (its own session, stdio to
+    devnull) so it outlives this process without the statusline waiting on it
+    or a leaked pipe holding the terminal open.
+    """
+    try:
+        kwargs = dict(
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, close_fds=True,
+        )
+        if hasattr(os, "setsid"):  # POSIX: detach from our process group
+            kwargs["start_new_session"] = True
+        subprocess.Popen([sys.executable, __file__, "--refresh-service-status"], **kwargs)
+    except OSError:
+        pass
+
+
+def _do_refresh_service_status():
+    """Fetch status.claude.com and atomically write the cache. Runs standalone.
+
+    Imports urllib lazily and only here: the main render path must not pay for
+    it, and must never touch the network at all. Any failure (network, bad
+    JSON, missing component, timeout) leaves the previous cache file alone --
+    a stale "operational" is harmless, and a stale incident is at worst a late
+    all-clear, never a fabricated one.
+    """
+    import urllib.request
+
+    try:
+        req = urllib.request.Request(
+            SERVICE_STATUS_URL, headers={"User-Agent": "claude-code-statusline"},
+        )
+        with urllib.request.urlopen(req, timeout=SERVICE_STATUS_TIMEOUT) as resp:
+            body = json.load(resp)
+    except Exception:
+        return
+
+    status = None
+    for comp in body.get("components", []) if isinstance(body, dict) else []:
+        if isinstance(comp, dict) and comp.get("name") == SERVICE_STATUS_COMPONENT:
+            status = comp.get("status")
+            break
+    if not isinstance(status, str):
+        return
+
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        tmp = f"{SERVICE_STATUS_CACHE_PATH}.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"status": status, "fetched_at": time.time()}, f)
+        os.replace(tmp, SERVICE_STATUS_CACHE_PATH)
+    except OSError:
+        pass
+
+
+def service_status_segment():
+    """Claude Code component health from status.claude.com, cache-only read.
+
+    The render path never makes a network call itself -- it reads whatever is
+    already on disk and, if that answer is missing or stale, kicks off a
+    background refresh for the *next* render and returns what it has now (which
+    may be nothing, on a cold cache). A hung or slow status page therefore can
+    never add latency to a prompt; the cost of a slow fetch is one extra render
+    without the segment, not a frozen terminal.
+    """
+    status, fetched_at = _read_service_status_cache()
+    stale = fetched_at is None or time.time() - fetched_at > SERVICE_STATUS_CACHE_SECS
+    if stale:
+        _spawn_background_refresh()
+
+    if status not in _SERVICE_STATUS_TIER:
+        return None  # operational, unknown, or no cache yet: say nothing
+    color, label = _SERVICE_STATUS_TIER[status]
+    return f"{color}{G_PULSE} {label}{RESET}"
+
+
 # ------------------------------------------------------------------ session
 
 SESSIONS_DIR_NAME = "sessions"
@@ -495,6 +611,14 @@ def main():
     badge = caveman_badge(cfg_dir)
     if badge:
         left.append((0, badge))
+
+    # An active incident on status.claude.com outranks everything else on the
+    # line -- it explains away odd behavior before you go looking for a local
+    # cause -- but it is invisible the overwhelming majority of the time
+    # (operational, or no cache yet), so in practice it costs nothing.
+    svc = service_status_segment()
+    if svc:
+        left.append((0, svc))
 
     model = dig(data, "model", "display_name")
     if model:
@@ -632,6 +756,16 @@ def main():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--refresh-service-status":
+        # Detached child spawned by service_status_segment(); does the one
+        # network call this script ever makes, then exits. No stdin to read,
+        # nothing to print -- a crash here is invisible and harmless, the next
+        # render just sees the same stale (or absent) cache and retries.
+        try:
+            _do_refresh_service_status()
+        except Exception:
+            pass
+        sys.exit(0)
     try:
         sys.exit(main())
     except Exception:
