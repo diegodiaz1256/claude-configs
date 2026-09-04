@@ -685,7 +685,11 @@ def main():
     if sess_id:
         tag = session_name_lookup(sess_id)
         if tag:
-            left.append((3, f"{GREY}ID {CYAN}{tag}{RESET}"))
+            # Quote a multi-word tag ("Omarchy setup review") so it visually
+            # stands apart from a bare short one ("work-aa") and reads as one
+            # name to pass whole to SendMessage, not several words.
+            shown = f'"{tag}"' if " " in tag else tag
+            left.append((3, f"{GREY}ID {CYAN}{shown}{RESET}"))
 
     vim_mode = dig(data, "vim", "mode")
     if vim_mode:
