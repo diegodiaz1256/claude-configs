@@ -104,11 +104,24 @@ Note that Claude Code does **not** expand `$HOME` in hook commands, so the
 placeholders in the example have to become real absolute paths before use. The
 `SessionStart` / `UserPromptSubmit` entries there are only meaningful with the
 [`caveman`](https://github.com/JuliusBrussee/caveman) plugin installed; drop them
-otherwise. Only `statusLine` is needed for this repo.
+otherwise. Only `statusLine` is needed for this repo. It also sets
+`attribution` — see below.
 
-`attribution.commit` and `attribution.pr` are set to `""`, which turns off the
-default `Co-Authored-By: Claude ...` / `Claude-Session: ...` trailers Claude
-Code otherwise appends to commit messages and PR descriptions.
+## Recommended: no attribution trailers
+
+```json
+"attribution": {
+  "commit": "",
+  "pr": ""
+}
+```
+
+Worth setting even outside this repo — in `~/.claude/settings.json` globally,
+not just here. By default Claude Code appends a `Co-Authored-By: Claude ...`
+line to every commit and a `Claude-Session: https://...` line to PR
+descriptions. Either empty string disables its trailer; nothing else about
+commit/PR behavior changes. Applies to new commits only — anything already
+pushed keeps whatever it already has.
 
 ## Tuning
 
