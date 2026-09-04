@@ -576,12 +576,13 @@ def session_name_lookup(session_id, cfg_dir=None):
             except (OSError, ValueError):
                 continue
             if isinstance(rec, dict) and rec.get("sessionId") == session_id:
-                # nameSource "auto" is an AI-generated long title (e.g. "Omarchy
-                # setup review"), not a SendMessage-addressable tag -- only
-                # "derived" (work-xx) and "user" (explicit --name/rename) are
-                # short handles. Treat "auto" as no usable name.
-                if rec.get("nameSource") not in ("derived", "user"):
-                    continue
+                # Every nameSource is SendMessage-addressable -- "auto" included.
+                # An earlier version of this filtered "auto" out on the theory
+                # that it meant a long AI-generated title rather than a short
+                # handle, but that was wrong: a session with nameSource "auto"
+                # (e.g. "pr-auditor-footer-styling") routes a SendMessage by
+                # that exact name just like a "derived" work-xx one does. The
+                # field describes how the name was picked, not whether it works.
                 name = rec.get("name")
                 if isinstance(name, str) and name:
                     return name
@@ -666,16 +667,25 @@ def main():
     if agent:
         left.append((2, f"{GREY}{G_AGENT} {agent}{RESET}"))
 
-    # Session tag: the short name (e.g. "work-aa") SendMessage/ListAgents use
-    # to address this session. That name isn't in the statusline JSON at all
-    # -- it lives in Claude Code's internal ~/.claude/sessions/<pid>.json,
-    # keyed by the same session_id we do get. Undocumented, best-effort: any
-    # lookup failure falls back to a hash slice that at least matches the
-    # bracketed suffix ListAgents prints next to the name.
+    # Session tag: the name SendMessage/ListAgents use to address this session
+    # (e.g. "work-aa", or an auto-generated one like "pr-auditor-footer-styling"
+    # -- both route). That name isn't in the statusline JSON at all -- it lives
+    # in Claude Code's internal ~/.claude/sessions/<pid>.json, keyed by the same
+    # session_id we do get.
+    #
+    # No fallback when the lookup comes up empty: an earlier version showed the
+    # first 6 chars of session_id instead, on the assumption that it matched
+    # the bracketed suffix ListAgents prints. It does not -- that suffix is
+    # derived some other way and does not appear anywhere in the session file,
+    # so the fallback was printing a plausible-looking ID that silently fails
+    # every SendMessage sent to it. Showing nothing is honest; showing a wrong
+    # ID is worse than showing none, since only one of those looks reachable
+    # to an agent that doesn't know better.
     sess_id = dig(data, "session_id")
     if sess_id:
-        tag = session_name_lookup(sess_id) or sess_id[:6]
-        left.append((3, f"{GREY}ID {CYAN}{tag}{RESET}"))
+        tag = session_name_lookup(sess_id)
+        if tag:
+            left.append((3, f"{GREY}ID {CYAN}{tag}{RESET}"))
 
     vim_mode = dig(data, "vim", "mode")
     if vim_mode:
