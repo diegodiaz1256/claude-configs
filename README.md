@@ -112,16 +112,20 @@ otherwise. Only `statusLine` is needed for this repo. It also sets
 ```json
 "attribution": {
   "commit": "",
-  "pr": ""
+  "pr": "",
+  "sessionUrl": false
 }
 ```
 
 Worth setting even outside this repo — in `~/.claude/settings.json` globally,
 not just here. By default Claude Code appends a `Co-Authored-By: Claude ...`
 line to every commit and a `Claude-Session: https://...` line to PR
-descriptions. Either empty string disables its trailer; nothing else about
-commit/PR behavior changes. Applies to new commits only — anything already
-pushed keeps whatever it already has.
+descriptions. `commit`/`pr` set to `""` disable those lines; `sessionUrl:
+false` is needed separately to also drop the `Claude-Session` trailer/link,
+since it does not follow `commit`/`pr` being blank (see
+[anthropics/claude-code#77830](https://github.com/anthropics/claude-code/issues/77830)).
+Applies to new commits only — anything already pushed keeps whatever it
+already has.
 
 ## Tuning
 
