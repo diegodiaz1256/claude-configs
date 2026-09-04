@@ -4,6 +4,10 @@
     "type": "command",
     "command": "python3 $HOME/.claude/hooks/statusline.py"
   },
+  "attribution": {
+    "commit": "",
+    "pr": ""
+  },
   "hooks": {
     "SessionStart": [
       {

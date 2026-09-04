@@ -106,6 +106,10 @@ placeholders in the example have to become real absolute paths before use. The
 [`caveman`](https://github.com/JuliusBrussee/caveman) plugin installed; drop them
 otherwise. Only `statusLine` is needed for this repo.
 
+`attribution.commit` and `attribution.pr` are set to `""`, which turns off the
+default `Co-Authored-By: Claude ...` / `Claude-Session: ...` trailers Claude
+Code otherwise appends to commit messages and PR descriptions.
+
 ## Tuning
 
 Most of these are overridable per machine via `~/.claude/statusline.local.json`
