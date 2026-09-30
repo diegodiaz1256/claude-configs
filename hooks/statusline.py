@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Claude Code statusline: two lines, gauge bars, 3-tier warn colors.
 
-Line 1: [CAVEMAN] model <badge>  branch*  PR  +added/-removed  agent  vim
-Line 2: ctx NN% (200K)  5h NN%  7d NN%  cache NN%  rate  turns
+Line 1: [CAVEMAN] model  branch*  PR  +added/-removed  agent  vim
+Line 2: ctx NN%  5h NN%  7d NN%  cache NN%
 
 Gauges render as a bare number while quiet and grow a segmented bar once
 past BAR_THRESHOLD, so line 2 only widens when something is actually filling up.
@@ -15,13 +15,6 @@ Wired via ~/.claude/settings.json:
 Every field is optional in the input JSON (rate_limits only exists for Pro/Max,
 and only after the first API response), so every read is defensive: a missing
 section drops its segment rather than raising.
-
-New features (v2):
-  A. Model-aware intelligence: tier badge, context window size, sustainable rate
-  B. Window analytics: ETA, pace score, bottleneck detection
-  C. Context intelligence: tokens remaining, context burn rate
-  D. Session analytics: session duration, total turns
-  F. Rate tracking: EMA smoothing, confidence indicator, per-window tracking
 """
 import json
 import os
@@ -58,14 +51,12 @@ LOCAL = load_local_config()
 
 RESET = "\033[0m"
 DIM = "\033[2m"
-BOLD = "\033[1m"
 ORANGE = "\033[38;5;172m"  # caveman badge
 GREY = "\033[38;5;245m"
 GREEN = "\033[38;5;71m"
 YELLOW = "\033[38;5;179m"
 RED = "\033[38;5;167m"
 CYAN = "\033[38;5;73m"
-PURPLE = "\033[38;5;141m"
 
 # ------------------------------------------------- Nerd Font glyphs (MesloLGS NF)
 # Every one of these needs a patched font. Set CLAUDE_STATUSLINE_ASCII=1 to fall
@@ -95,9 +86,6 @@ G_UP = "" if NF else "^"       # arrow-up, burning ahead of pace
 G_DOWN = "" if NF else "v"     # arrow-down, comfortably behind pace
 G_TTL = "" if NF else "exp"    # clock-o, cache expiry
 G_PULSE = "" if NF else "SVC"  # heartbeat, status.claude.com component health
-G_RATE = "" if NF else "r/h"   # tachometer, consumption rate per hour
-G_TURNS = "" if NF else "~t"    # hourglass-half, estimated turns remaining
-G_BOLT = "⚡"                   # bottleneck indicator (unicode, no NF needed)
 
 
 def tier(pct):
@@ -128,7 +116,7 @@ COMPACT_WARN = 85.0
 # Fixed rate-limit window lengths, needed to turn "resets_at" into elapsed
 # share for the burn-rate comparison. Only the 5-hour window gets a pace arrow:
 # over seven days a double-digit drift is ordinary variation, not a warning.
-WINDOW_SECS = {"five_hour": 5 * 3600, "seven_day": 7 * 86400}
+WINDOW_SECS = {"five_hour": 5 * 3600}
 
 # Only warn about cache expiry when a pause would actually cost a re-cache
 # soon; a 40-minute TTL is not news.
@@ -146,40 +134,6 @@ BURN_ALWAYS_PCT = LOCAL.get("burn_always_pct", 50.0)
 
 # How far pct can drift from elapsed-share before the pace arrow fires.
 BURN_DRIFT_THRESHOLD = LOCAL.get("burn_drift_threshold", 5.0)
-
-# --------------------------------------------------- rate & turns estimation
-# Snapshots of rate-limit percentages, persisted to disk so the rate survives
-# across renders and even across short restarts. Keyed by session_id.
-RATE_CACHE_MAX_SNAPSHOTS = LOCAL.get("rate_max_snapshots", 200)
-RATE_CACHE_MIN_INTERVAL_SECS = LOCAL.get("rate_min_interval", 10.0)
-# Need enough elapsed time for the slope to mean something.
-RATE_MIN_DATA_SECS = LOCAL.get("rate_min_data_secs", 120.0)
-# A "turn" is a distinct pct jump separated by a time gap. Small intra-turn
-# renders that nudge the pct by dust don't count.
-RATE_JUMP_THRESHOLD = LOCAL.get("rate_jump_threshold", 0.1)
-RATE_JUMP_MIN_GAP_SECS = LOCAL.get("rate_jump_min_gap", 15.0)
-RATE_MIN_TURNS = LOCAL.get("rate_min_turns", 2)
-# EMA alpha for smoothing per-interval rates (Feature 13)
-RATE_EMA_ALPHA = LOCAL.get("rate_ema_alpha", 0.3)
-# Minimum snapshots to use EMA instead of linear (Feature 13)
-RATE_EMA_MIN_SNAPS = LOCAL.get("rate_ema_min_snaps", 4)
-# Minimum jumps for high-confidence turn estimate (Feature 14)
-RATE_CONFIDENCE_MIN_JUMPS = LOCAL.get("rate_confidence_min_jumps", 3)
-# Minimum snaps for high-confidence rate (Feature 14)
-RATE_CONFIDENCE_MIN_SNAPS = LOCAL.get("rate_confidence_min_snaps", 4)
-
-# Model-aware sustainable rate thresholds (Feature 3 / A)
-# Overrides RATE_SUSTAINABLE based on model tier:
-RATE_SUSTAINABLE_BY_TIER = {
-    "opus":   LOCAL.get("rate_sustainable_opus",   15.0),
-    "ultra":  LOCAL.get("rate_sustainable_ultra",  15.0),
-    "sonnet": LOCAL.get("rate_sustainable_sonnet", 20.0),
-    "pro":    LOCAL.get("rate_sustainable_pro",    20.0),
-    "flash":  LOCAL.get("rate_sustainable_flash",  35.0),
-    "haiku":  LOCAL.get("rate_sustainable_haiku",  35.0),
-}
-RATE_SUSTAINABLE = LOCAL.get("rate_sustainable", 20.0)  # fallback
-RATE_WARN = LOCAL.get("rate_warn", 30.0)
 
 # Reading HEAD is a single file read, so a short timeout is plenty. The dirty
 # check walks the work tree and gets its own, larger budget — on a WSL2 mount of
@@ -374,81 +328,6 @@ def dig(d, *path, default=None):
             return default
         cur = cur[k]
     return default if cur is None else cur
-
-
-# ---------------------------------------------------------------- model tier (Feature A)
-
-# Known context window sizes by model tier (K tokens)
-MODEL_CONTEXT_K = {
-    "opus":   200,
-    "sonnet": 200,
-    "haiku":  200,
-    "flash":  1000,
-    "pro":    128,
-    "ultra":  200,
-}
-
-# Default context window size (K) for unknown models
-MODEL_CONTEXT_K_DEFAULT = 200
-
-
-def detect_model_tier(display_name):
-    """Detect model family from display_name string. Returns lowercase tier name or None."""
-    if not display_name or not isinstance(display_name, str):
-        return None
-    dn = display_name.lower()
-    for tier_name in ("opus", "ultra", "sonnet", "haiku", "flash", "pro"):
-        if tier_name in dn:
-            return tier_name
-    return None
-
-
-def model_badge(tier_name, display_name=None):
-    """Return colored model tier badge string with version if present."""
-    ver = ""
-    if display_name:
-        m_ver = re.search(r"\b(\d+(?:\.\d+)?)\b", display_name)
-        if m_ver:
-            ver = m_ver.group(1)
-
-    dn = (display_name or "").lower()
-    prefix = ""
-    if "gemini" in dn:
-        prefix = f"{BOLD}{CYAN}G{ver}{RESET} " if ver else f"{CYAN}G{RESET} "
-    elif "claude" in dn:
-        prefix = f"{PURPLE}C{ver}{RESET} " if ver else f"{PURPLE}C{RESET} "
-    elif "gpt" in dn:
-        prefix = f"{YELLOW}GPT{RESET} "
-
-    if tier_name == "opus":
-        b = f"{BOLD}{PURPLE}OPS{RESET}"
-    elif tier_name == "sonnet":
-        b = f"{CYAN}SNT{RESET}"
-    elif tier_name == "haiku":
-        b = f"{GREEN}HKU{RESET}"
-    elif tier_name == "flash":
-        b = f"{YELLOW}FLS{RESET}"
-    elif tier_name == "pro":
-        b = f"{CYAN}PRO{RESET}"
-    elif tier_name == "ultra":
-        b = f"{BOLD}{RED}ULT{RESET}"
-    else:
-        b = f"{GREY}???{RESET}"
-    return f"{prefix}{b}" if prefix else b
-
-
-def model_context_k(tier_name):
-    """Return known context window size in K tokens for model tier. Feature A.2."""
-    if tier_name:
-        return MODEL_CONTEXT_K.get(tier_name, MODEL_CONTEXT_K_DEFAULT)
-    return MODEL_CONTEXT_K_DEFAULT
-
-
-def model_sustainable_rate(tier_name):
-    """Return sustainable %/h rate for this model tier. Feature A.3."""
-    if tier_name:
-        return RATE_SUSTAINABLE_BY_TIER.get(tier_name, RATE_SUSTAINABLE)
-    return RATE_SUSTAINABLE
 
 
 # ------------------------------------------------------------------ caveman
@@ -666,268 +545,6 @@ def service_status_segment():
     return f"{color}{G_PULSE} {label}{RESET}"
 
 
-# ------------------------------------------------------- rate & turns tracking
-# Per-window tracking: track five_hour and seven_day separately (Feature 15/F)
-
-
-def _rate_cache_path(session_id):
-    """Cache file path for rate-tracking snapshots, keyed by session."""
-    key = re.sub(r"[^A-Za-z0-9]", "_", session_id)[-60:]
-    return os.path.join(CACHE_DIR, f"rate-{key}.json")
-
-
-def _load_rate_cache(session_id):
-    """Load rate-tracking snapshots from disk, or return an empty structure."""
-    path = _rate_cache_path(session_id)
-    try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict) or data.get("sid") != session_id:
-            return {"sid": session_id, "snaps": [], "snaps_5h": [], "snaps_7d": []}
-        # Ensure per-window arrays exist (upgrade old caches gracefully)
-        for key in ("snaps", "snaps_5h", "snaps_7d"):
-            if not isinstance(data.get(key), list):
-                data[key] = []
-        return data
-    except (OSError, ValueError):
-        return {"sid": session_id, "snaps": [], "snaps_5h": [], "snaps_7d": []}
-
-
-def _save_rate_cache(cache):
-    """Persist rate-tracking snapshots to disk, atomically."""
-    path = _rate_cache_path(cache["sid"])
-    try:
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        tmp = f"{path}.{os.getpid()}"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(cache, f, separators=(",", ":"))
-        os.replace(tmp, path)
-    except OSError:
-        pass
-
-
-def _ema_rate(snaps):
-    """Compute EMA-smoothed rate in %/hour from snapshot list.
-
-    Feature 13/F: Uses Exponential Moving Average of per-interval rates
-    (alpha=0.3) to smooth out bursty turns. Falls back to linear if <4 samples.
-
-    Returns (rate_pct_per_hour, is_confident).
-    """
-    if len(snaps) < 2:
-        return None, False
-
-    if len(snaps) < RATE_EMA_MIN_SNAPS:
-        # Linear fallback: first→last slope
-        first, last = snaps[0], snaps[-1]
-        dt = last["t"] - first["t"]
-        dp = last["p"] - first["p"]
-        if dt >= RATE_MIN_DATA_SECS and dp > 0:
-            return dp / (dt / 3600.0), False
-        return None, False
-
-    # EMA of per-interval rates
-    ema = None
-    total_dt = snaps[-1]["t"] - snaps[0]["t"]
-    if total_dt < RATE_MIN_DATA_SECS:
-        return None, False
-
-    for i in range(1, len(snaps)):
-        dt_i = snaps[i]["t"] - snaps[i - 1]["t"]
-        dp_i = snaps[i]["p"] - snaps[i - 1]["p"]
-        if dt_i <= 0:
-            continue
-        r_i = dp_i / (dt_i / 3600.0)
-        if ema is None:
-            ema = r_i
-        else:
-            ema = RATE_EMA_ALPHA * r_i + (1 - RATE_EMA_ALPHA) * ema
-
-    if ema is None or ema <= 0:
-        return None, False
-
-    return ema, len(snaps) >= RATE_CONFIDENCE_MIN_SNAPS
-
-
-def _count_jumps_and_turns(snaps, pct):
-    """Count detected turns and estimate remaining turns.
-
-    Returns (jumps, est_turns, is_confident).
-    Feature 14/F: confidence flag when <RATE_CONFIDENCE_MIN_JUMPS jumps.
-    """
-    if len(snaps) < 3:
-        return 0, None, False
-
-    jumps = 0
-    total_delta = 0.0
-    last_jump_t = 0.0
-    for i in range(1, len(snaps)):
-        delta = snaps[i]["p"] - snaps[i - 1]["p"]
-        if (delta > RATE_JUMP_THRESHOLD
-                and snaps[i]["t"] - last_jump_t >= RATE_JUMP_MIN_GAP_SECS):
-            jumps += 1
-            total_delta += delta
-            last_jump_t = snaps[i]["t"]
-
-    if jumps < RATE_MIN_TURNS or total_delta <= 0:
-        return jumps, None, False
-
-    avg_per_turn = total_delta / jumps
-    remaining = 100.0 - pct
-    turns = max(0, int(remaining / avg_per_turn)) if remaining > 0 else 0
-    confident = jumps >= RATE_CONFIDENCE_MIN_JUMPS
-    return jumps, turns, confident
-
-
-def _append_snap(snaps, now, pct, max_snaps=RATE_CACHE_MAX_SNAPSHOTS):
-    """Throttle and append snapshot; reset on window rollover."""
-    if snaps and pct < snaps[-1].get("p", 0) - 0.5:
-        snaps = []
-    if not snaps or now - snaps[-1]["t"] >= RATE_CACHE_MIN_INTERVAL_SECS:
-        snaps.append({"t": now, "p": pct})
-        if len(snaps) > max_snaps:
-            snaps = snaps[-max_snaps:]
-    return snaps
-
-
-def record_and_analyze(session_id, five_h_pct, seven_d_pct):
-    """Record rate-limit snapshots per window and return analytics.
-
-    Feature 15/F: track 5h and 7d windows in separate snap arrays.
-    Feature 13/F: EMA smoothing.
-    Feature 14/F: confidence indicators.
-
-    Returns:
-        (rate_per_hour, est_turns, rate_confident, turns_confident,
-         session_start_t, total_jumps)
-    """
-    if not session_id:
-        return None, None, False, False, None, 0
-
-    cache = _load_rate_cache(session_id)
-    now = time.time()
-
-    # Per-window tracking (Feature 15)
-    pct_5h = float(five_h_pct) if five_h_pct is not None else None
-    pct_7d = float(seven_d_pct) if seven_d_pct is not None else None
-
-    # Pick primary tracking metric: 5h bites first
-    pct = pct_5h if pct_5h is not None else pct_7d
-    if pct is None:
-        return None, None, False, False, None, 0
-
-    # Update per-window snaps
-    if pct_5h is not None:
-        cache["snaps_5h"] = _append_snap(cache.get("snaps_5h", []), now, pct_5h)
-    if pct_7d is not None:
-        cache["snaps_7d"] = _append_snap(cache.get("snaps_7d", []), now, pct_7d)
-
-    # Also update combined snaps (for backward compat / session-start tracking)
-    cache["snaps"] = _append_snap(cache.get("snaps", []), now, pct)
-
-    _save_rate_cache(cache)
-
-    # Use 5h snaps preferentially for rate/turns, fall back to combined
-    active_snaps = cache["snaps_5h"] if cache.get("snaps_5h") else cache["snaps"]
-
-    # --- Compute rate with EMA ---
-    rate, rate_confident = _ema_rate(active_snaps)
-
-    # --- Estimate turns remaining ---
-    jumps, est_turns, turns_confident = _count_jumps_and_turns(active_snaps, pct)
-
-    # Session start = first snapshot timestamp
-    all_snaps = cache.get("snaps", [])
-    session_start_t = all_snaps[0]["t"] if all_snaps else None
-
-    return rate, est_turns, rate_confident, turns_confident, session_start_t, jumps
-
-
-# ---------------------------------------------------------------- window analytics (Feature B)
-
-
-def window_eta_secs(pct, rate_pct_per_hour):
-    """Estimate seconds until quota hits 100% at current rate. Feature B.4.
-
-    Returns None if rate unknown or infinite.
-    """
-    if rate_pct_per_hour is None or rate_pct_per_hour <= 0:
-        return None
-    remaining_pct = 100.0 - float(pct)
-    if remaining_pct <= 0:
-        return 0
-    hours = remaining_pct / rate_pct_per_hour
-    return hours * 3600.0
-
-
-def pace_score(pct, resets_at, window_secs):
-    """Pace score: ratio of (pct_used / pct_of_window_elapsed). Feature B.5.
-
-    >1.2 burning fast (red), 0.8-1.2 on-pace (yellow), <0.8 efficient (green).
-    Returns (score, color_str) or (None, None).
-    """
-    if not resets_at or not window_secs or pct is None:
-        return None, None
-    remaining = int(resets_at) - int(time.time())
-    if remaining <= 0 or remaining >= window_secs:
-        return None, None
-    elapsed_share = (window_secs - remaining) / window_secs * 100.0
-    if elapsed_share < 5.0:
-        return None, None  # too early for meaningful score
-    pct_f = float(pct)
-    if pct_f <= 0 or elapsed_share <= 0:
-        return None, None
-    score = pct_f / elapsed_share
-    if score > 1.2:
-        color = RED
-    elif score >= 0.8:
-        color = YELLOW
-    else:
-        color = GREEN
-    return score, color
-
-
-def find_bottleneck(windows):
-    """Find the window that will be exhausted first. Feature B.6.
-
-    `windows`: list of (key, pct, resets_at, window_secs, rate_pct_per_hour)
-    Returns index of bottleneck window, or None if not determinable.
-    Only returns a value when ETA < reset time for at least one window.
-    """
-    min_eta = None
-    min_idx = None
-    for i, (key, pct, resets_at, wsecs, rate) in enumerate(windows):
-        if pct is None or rate is None:
-            continue
-        eta = window_eta_secs(pct, rate)
-        if eta is None:
-            continue
-        reset_secs = (int(resets_at) - int(time.time())) if resets_at else None
-        if reset_secs is None or eta >= reset_secs:
-            continue  # won't hit cap before reset
-        if min_eta is None or eta < min_eta:
-            min_eta = eta
-            min_idx = i
-    return min_idx
-
-
-# ------------------------------------------------------------------ session (Feature D)
-
-
-def format_session_duration(session_start_t):
-    """Format session duration as 'Xh Ym'. Feature D.9."""
-    if session_start_t is None:
-        return None
-    elapsed = time.time() - session_start_t
-    if elapsed < 60:
-        return None  # too short to be informative
-    h = int(elapsed // 3600)
-    m = int((elapsed % 3600) // 60)
-    if h > 0:
-        return f"{h}h{m:02d}m"
-    return f"{m}m"
-
-
 # ------------------------------------------------------------------ session
 
 SESSIONS_DIR_NAME = "sessions"
@@ -1000,12 +617,6 @@ def main():
     # this session is not in. Better to show no branch than the wrong one.
     cwd = dig(data, "workspace", "current_dir") or data.get("cwd")
 
-    # Detect model tier early — used in multiple places
-    model_display = dig(data, "model", "display_name")
-    m_tier = detect_model_tier(model_display)
-    ctx_k = model_context_k(m_tier)
-    sustainable_rate = model_sustainable_rate(m_tier)
-
     # ---- line 1: identity + money
     left = []
 
@@ -1021,16 +632,12 @@ def main():
     if svc:
         left.append((0, svc))
 
-    if model_display:
+    model = dig(data, "model", "display_name")
+    if model:
         fast = f" {YELLOW}{G_FAST}{RESET}" if data.get("fast_mode") else ""
         effort = dig(data, "effort", "level")
         suffix = f"{GREY}:{effort}{RESET}" if effort else ""
-        # Feature A.1: model tier badge
-        tier_badge = model_badge(m_tier, model_display)
-        left.append((0, (
-            f"{CYAN}{G_MODEL}{RESET} \033[1m{model_display}{RESET}{suffix}"
-            f" {DIM}·{RESET} {tier_badge}{fast}"
-        )))
+        left.append((0, f"{CYAN}{G_MODEL}{RESET} \033[1m{model}{RESET}{suffix}{fast}"))
 
     git = git_segment(cwd)
     if git:
@@ -1072,10 +679,42 @@ def main():
         left.append((2, f"{GREY}{G_AGENT} {agent}{RESET}"))
 
     # Session tag: the name SendMessage/ListAgents use to address this session
+    # (e.g. "work-aa", or an auto-generated one like "pr-auditor-footer-styling"
+    # -- both route). That name isn't in the statusline JSON at all -- it lives
+    # in Claude Code's internal ~/.claude/sessions/<pid>.json, keyed by the same
+    # session_id we do get.
+    #
+    # No fallback when the lookup comes up empty: an earlier version showed the
+    # first 6 chars of session_id instead, on the assumption that it matched
+    # the bracketed suffix ListAgents prints. It does not -- that suffix is
+    # derived some other way and does not appear anywhere in the session file,
+    # so the fallback was printing a plausible-looking ID that silently fails
+    # every SendMessage sent to it. Showing nothing is honest; showing a wrong
+    # ID is worse than showing none, since only one of those looks reachable
+    # to an agent that doesn't know better.
     sess_id = dig(data, "session_id")
     if sess_id:
         tag = session_name_lookup(sess_id)
         if tag:
+            # Quote a multi-word tag ("Omarchy setup review") so it visually
+            # stands apart from a bare short one ("work-aa") and reads as one
+            # name to pass whole to SendMessage, not several words.
+            #
+            # Label is "as", not "ID": "ID" reads like a stable, portable
+            # identifier and invites copy-pasting this value into another
+            # session's SendMessage as if it were a durable address -- it
+            # isn't. This is a self-report (same string ListAgents prints as
+            # "This session is X [ref]" for itself); it's dialable by a peer
+            # that already has this session in ITS OWN live ListAgents, but
+            # not by one that doesn't. And it isn't just unreachable-or-not:
+            # the name/ref itself drifts (auto-derived from conversation
+            # title), so a value read off this line can go stale between
+            # when it's read and when someone hands it to another session --
+            # not only across renders. "as work-aa" says "this is what I'm
+            # currently called right now" without implying portability or
+            # shelf life. (Confirmed with a peer session that hit this exact
+            # footgun cross-machine -- see memory
+            # sendmessage-self-reported-name-unreachable.)
             shown = f'"{tag}"' if " " in tag else tag
             left.append((3, f"{GREY}as {CYAN}{shown}{RESET}"))
 
@@ -1083,21 +722,10 @@ def main():
     if vim_mode:
         left.append((5, f"{GREY}{vim_mode}{RESET}"))
 
-    # ---- line 2: the gauges
+    # ---- line 2: the three gauges
+    gauges = []
 
-    # --- Rate & turns tracking (Features D, F) ---
-    sess_for_rate = dig(data, "session_id")
-    five_h_pct = dig(data, "rate_limits", "five_hour", "used_percentage")
-    seven_d_pct = dig(data, "rate_limits", "seven_day", "used_percentage")
-
-    (rate, est_turns, rate_confident, turns_confident,
-     session_start_t, total_jumps) = record_and_analyze(
-        sess_for_rate, five_h_pct, seven_d_pct
-    )
-
-    # --- Context window analytics (Feature C) ---
     ctx_pct = dig(data, "context_window", "used_percentage")
-    ctx_prev_pct = None  # will try to get from cache for burn rate
     if ctx_pct is None:
         # Before the first API response there is no percentage. Fall back to
         # deriving one from raw counts so the bar is not blank on turn one.
@@ -1110,125 +738,36 @@ def main():
                           "cache_creation_input_tokens")
             )
             ctx_pct = used / size * 100.0
-
-    # Context burn rate: track ctx_pct in cache for per-turn delta
-    ctx_burn_str = None
-    ctx_remaining_str = None
-    if ctx_pct is not None and sess_for_rate:
-        cache_r = _load_rate_cache(sess_for_rate)
-        ctx_snaps = cache_r.get("ctx_snaps", [])
-        now_t = time.time()
-
-        # Reset on context compaction (pct drops significantly)
-        if ctx_snaps and float(ctx_pct) < ctx_snaps[-1].get("p", 0) - 5.0:
-            ctx_snaps = []
-
-        if not ctx_snaps or now_t - ctx_snaps[-1]["t"] >= RATE_CACHE_MIN_INTERVAL_SECS:
-            ctx_snaps.append({"t": now_t, "p": float(ctx_pct)})
-            if len(ctx_snaps) > RATE_CACHE_MAX_SNAPSHOTS:
-                ctx_snaps = ctx_snaps[-RATE_CACHE_MAX_SNAPSHOTS:]
-            cache_r["ctx_snaps"] = ctx_snaps
-            _save_rate_cache(cache_r)
-
-        # Feature C.8: context burn rate (%/turn)
-        if len(ctx_snaps) >= 3:
-            ctx_jumps = []
-            last_ctx_t = 0.0
-            for i in range(1, len(ctx_snaps)):
-                d = ctx_snaps[i]["p"] - ctx_snaps[i - 1]["p"]
-                if d > RATE_JUMP_THRESHOLD and ctx_snaps[i]["t"] - last_ctx_t >= RATE_JUMP_MIN_GAP_SECS:
-                    ctx_jumps.append(d)
-                    last_ctx_t = ctx_snaps[i]["t"]
-            if ctx_jumps:
-                avg_ctx_delta = sum(ctx_jumps) / len(ctx_jumps)
-                if avg_ctx_delta >= 0.5:
-                    ctx_burn_str = f"ctx +{avg_ctx_delta:.1f}%/t"
-
-        # Feature C.7: tokens remaining when >50% used
-        if float(ctx_pct) >= 50.0:
-            remaining_pct = 100.0 - float(ctx_pct)
-            remaining_k = int(remaining_pct / 100.0 * ctx_k)
-            if remaining_k > 0:
-                ctx_remaining_str = f"~{remaining_k}Kt left"
-
-    # --- Compute window ETAs for bottleneck detection (Feature B.4, B.6) ---
-    five_h_resets = dig(data, "rate_limits", "five_hour", "resets_at")
-    seven_d_resets = dig(data, "rate_limits", "seven_day", "resets_at")
-
-    windows_info = [
-        ("five_hour", five_h_pct, five_h_resets, WINDOW_SECS.get("five_hour"), rate),
-        ("seven_day", seven_d_pct, seven_d_resets, WINDOW_SECS.get("seven_day"), rate),
-    ]
-    bottleneck_idx = find_bottleneck(windows_info)
-
-    gauges = []
-
-    # --- Context gauge ---
     if ctx_pct is not None:
-        # Feature A.2: show context window size in K tokens
+        # Window size is fixed for the session, so it earns no permanent column;
+        # the percentage is the part that moves.
         g = gauge(G_CTX, ctx_pct)
-        g += f" {DIM}({ctx_k}K){RESET}"
-        # Auto-compact is close enough to matter here
+        # Auto-compact is close enough to matter here: the bar already shows the
+        # level, but the warning says it is about to act on its own.
         if float(ctx_pct) >= COMPACT_WARN:
             g += f" {YELLOW}{G_WARN}{RESET}"
         gauges.append((0, g))
 
-    # Feature C.7: tokens remaining (droppable, priority 6)
-    if ctx_remaining_str:
-        gauges.append((6, f"{GREY}{ctx_remaining_str}{RESET}"))
-
-    # Feature C.8: context burn rate (droppable, priority 7)
-    if ctx_burn_str:
-        gauges.append((7, f"{DIM}{ctx_burn_str}{RESET}"))
-
-    # --- Rate-limit window gauges ---
     # The 5-hour window bites first, so it outranks the weekly one when the
     # terminal is too narrow to hold both.
-    for idx, (key, glyph, prio) in enumerate((
-        ("five_hour", G_CLOCK, 1),
-        ("seven_day", G_CAL, 2),
-        ("spend_limit", G_WALLET, 2),
-    )):
+    for key, glyph, prio in (("five_hour", G_CLOCK, 1),
+                             ("seven_day", G_CAL, 2),
+                             ("spend_limit", G_WALLET, 2)):
         pct = dig(data, "rate_limits", key, "used_percentage")
         if pct is None:
             continue
-        resets_at = dig(data, "rate_limits", key, "resets_at")
-        wsecs = WINDOW_SECS.get(key)
-
-        # Feature B.6: bottleneck indicator (⚡ prefix on bottleneck window)
-        is_bottleneck = (idx == bottleneck_idx)
-        prefix = f"{YELLOW}{G_BOLT}{RESET} " if is_bottleneck else ""
-
-        g = prefix + gauge(glyph, pct)
-
-        arrow = burn_arrow(pct, resets_at, wsecs)
+        g = gauge(glyph, pct)
+        arrow = burn_arrow(pct, dig(data, "rate_limits", key, "resets_at"),
+                           WINDOW_SECS.get(key))
         if arrow:
             g += f" {arrow}"
-
-        # Feature B.5: pace score
-        ps, ps_color = pace_score(pct, resets_at, wsecs)
-        if ps is not None:
-            g += f" {ps_color}pace {ps:.1f}x{RESET}"
-
         # Always show the reset clock: knowing when a window rolls over is
         # useful at 8% too, not only once it is nearly spent.
-        reset = until(resets_at)
+        reset = until(dig(data, "rate_limits", key, "resets_at"))
         if reset:
+            # Nerd Font glyphs render full-width; without padding on both
+            # sides the reload icon collides with the % and the duration.
             g += f" {GREY}{G_RESET} {reset}{RESET}"
-
-        # Feature B.4: window ETA (show when on pace to hit cap)
-        if rate is not None and resets_at:
-            eta_secs = window_eta_secs(pct, rate)
-            reset_remaining = int(resets_at) - int(time.time())
-            if eta_secs is not None and reset_remaining > 0 and eta_secs < reset_remaining:
-                eta_h = int(eta_secs // 3600)
-                eta_m = int((eta_secs % 3600) // 60)
-                if eta_h > 0:
-                    eta_str = f"~{eta_h}h"
-                else:
-                    eta_str = f"~{eta_m}m"
-                g += f" {RED}hit {eta_str}{RESET}"
-
         gauges.append((prio, g))
 
     # Cache hit ratio is the one gauge where high is good, so it would read
@@ -1250,37 +789,6 @@ def main():
         if 0 < left_secs <= CACHE_TTL_WARN_SECS:
             left_str = until(expires_at)
             gauges.append((3, f"{GREY}{G_TTL}{RESET} {YELLOW}{left_str}{RESET}"))
-
-    # ---- consumption rate and estimated turns remaining (Feature F)
-    if rate is not None:
-        # Feature A.3: model-aware sustainable rate thresholds
-        conf_suffix = "" if rate_confident else "?"
-        if rate >= RATE_WARN:
-            rate_color = RED
-        elif rate >= sustainable_rate:
-            rate_color = YELLOW
-        else:
-            rate_color = GREEN
-        gauges.append((5, f"{GREY}{G_RATE}{RESET} {rate_color}{rate:.1f}%/h{conf_suffix}{RESET}"))
-
-    if est_turns is not None:
-        conf_suffix = "" if turns_confident else "?"
-        if est_turns > 20:
-            turns_color = GREEN
-        elif est_turns > 5:
-            turns_color = YELLOW
-        else:
-            turns_color = RED
-        gauges.append((6, f"{GREY}{G_TURNS}{RESET} {turns_color}~{est_turns}t{conf_suffix}{RESET}"))
-
-    # Feature D.9: session duration (priority 7)
-    sess_dur = format_session_duration(session_start_t)
-    if sess_dur:
-        gauges.append((7, f"{GREY}sess {sess_dur}{RESET}"))
-
-    # Feature D.10: total turns this session (priority 8)
-    if total_jumps >= RATE_MIN_TURNS:
-        gauges.append((8, f"{GREY}{total_jumps}t total{RESET}"))
 
     budget = term_width()
     lines = [s for s in (fit(left, budget), fit(gauges, budget)) if s]
