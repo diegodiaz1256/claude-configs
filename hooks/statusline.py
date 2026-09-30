@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Claude Code statusline: two lines, gauge bars, 3-tier warn colors.
 
-Line 1: [CAVEMAN] model  branch*  PR  +added/-removed  agent  vim
+Line 1: [CAVEMAN] @host model  branch* ↑N  PR  +added/-removed  agent  vim
 Line 2: ctx NN%  5h NN%  7d NN%  cache NN%
 
 Gauges render as a bare number while quiet and grow a segmented bar once
@@ -19,6 +19,7 @@ section drops its segment rather than raising.
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -440,7 +441,16 @@ def git_segment(cwd):
     # flags first: -uno skips untracked files, which is the expensive part of the
     # walk, and the marker only reports tracked modifications.
     mark = "*" if dirty_cached(cwd) else ""
-    return f"{CYAN}{branch}{RED}{mark}{RESET}"
+    seg = f"{CYAN}{branch}{RED}{mark}{RESET}"
+
+    # Commits made here but not pushed yet. Only reads refs, never the work
+    # tree, so it is cheap enough to skip the dirty check's disk cache. No
+    # upstream (a local-only branch) fails the rev-list, which shows nothing
+    # rather than a count against the wrong base.
+    ahead = _git(cwd, ["rev-list", "--count", "@{upstream}..HEAD"], GIT_HEAD_TIMEOUT)
+    if ahead and ahead != "0":
+        seg += f" {YELLOW}\u2191{ahead}{RESET}"
+    return seg
 
 
 # -------------------------------------------------------------- service status
@@ -631,6 +641,14 @@ def main():
     svc = service_status_segment()
     if svc:
         left.append((0, svc))
+
+    # Which machine this is, but only over SSH: sessions get resumed on remote
+    # hosts from the same laptop, and two terminals side by side otherwise look
+    # identical. Hidden locally, where the answer is always "this one".
+    if os.environ.get("SSH_CONNECTION"):
+        host = socket.gethostname().split(".")[0]
+        if host:
+            left.append((0, f"{YELLOW}@{host}{RESET}"))
 
     model = dig(data, "model", "display_name")
     if model:
